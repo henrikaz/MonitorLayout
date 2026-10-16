@@ -31,6 +31,7 @@ HELP = """usage: monitor-layout NAME            apply layout (auto if not record
        monitor-layout record NAME     save current layout as NAME, then key menu
        monitor-layout keys            which %sF1..F12 are free
        monitor-layout --list          monitors, layouts, shortcuts
+       monitor-layout --unbind-all    remove all shortcuts made by this tool
   --dry-run  show plan only
   --save     make GNOME remember it (asks "Keep changes?")""" % (
     MOD, UNDO.replace(os.path.expanduser('~'), '~'), MOD)
@@ -321,6 +322,23 @@ def keys():
         print('%-14s %s' % (a, who or 'free'))
 
 
+def unbind_all():
+    # remove every shortcut made by this tool, leave others alone
+    from gi.repository import Gio
+    root, entry = kb_settings()
+    paths = list(root.get_strv('custom-keybindings'))
+    gone = []
+    for p in [p for p in paths if p.startswith(KB_MINE)]:
+        e = entry(p)
+        gone.append('%s (%s)' % (e.get_string('binding') or '-', e.get_string('command').split()[-1]))
+        for k in ('name', 'command', 'binding'):
+            e.reset(k)
+        paths.remove(p)
+    root.set_strv('custom-keybindings', paths)
+    Gio.Settings.sync()
+    return gone
+
+
 def short(hits):
     return ', '.join(h[0].replace('org.gnome.settings-daemon.plugins.', '').replace('org.gnome.', '')
                      for h in hits)
@@ -442,6 +460,11 @@ def main(argv):
 
     if args == ['keys']:
         keys()
+        return 0
+
+    if '--unbind-all' in flags:
+        gone = unbind_all()
+        print('removed shortcuts: ' + ', '.join(gone) if gone else 'no shortcuts to remove')
         return 0
 
     if len(args) == 2 and args[1] == 'free':
