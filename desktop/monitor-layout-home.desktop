@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Monitors: Home
+Comment=Apply home monitor layout
+Exec=python3 @BIN@ home
+Icon=video-display
+Terminal=false
+Categories=Utility;Settings;
+Keywords=display;monitor;screen;layout;home;
+Actions=record;
+
+[Desktop Action record]
+Name=Record current layout as Home
+Exec=python3 @BIN@ record home

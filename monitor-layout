@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+# monitor-layout: save/apply monitor layouts on GNOME (X11 + Wayland) via Mutter D-Bus.
+# Monitors matched by EDID (vendor/product/serial), not connector name:
+# connector names change with GPU mode / port (DP-2, DP-1-1, HDMI-1-0 ...).
+#
+# NAME without a recording -> auto: laptop top center, externals below (USB-C/DP left, HDMI right).
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+CONF = os.path.expanduser('~/.config/monitor-layout.json')
+UNDO = os.path.expanduser('~/.config/monitor-layout-freed.sh')  # restores keys taken by --force
+
+# Path used in keyboard shortcuts: installed link if present, so moving the repo won't break them
+BIN = os.path.expanduser('~/.local/bin/monitor-layout')
+if not os.path.exists(BIN):
+    BIN = os.path.abspath(__file__)
+
+# Shortcut modifier for "NAME N" -> MOD+FN. GNOME can't tell left/right Shift apart;
+# '<Shift>' works but steals Shift+F1.. from PhpStorm/VS Code.
+MOD = '<Super>'
+
+HELP = """usage: monitor-layout NAME            apply layout (auto if not recorded)
+       monitor-layout NAME N          shortcut %sF<N> -> NAME (N=0 removes)
+       monitor-layout NAME N --force  take the key from GNOME (undo: sh %s)
+       monitor-layout NAME auto       shortcut on first F-key GNOME doesn't use
+       monitor-layout NAME free       menu: pick shortcut F-key
+       monitor-layout record NAME     save current layout as NAME, then key menu
+       monitor-layout keys            which %sF1..F12 are free
+       monitor-layout --list          monitors, layouts, shortcuts
+  --dry-run  show plan only
+  --save     make GNOME remember it (asks "Keep changes?")""" % (
+    MOD, UNDO.replace(os.path.expanduser('~'), '~'), MOD)
+
+BUS = 'org.gnome.Mutter.DisplayConfig'
+OBJ = '/org/gnome/Mutter/DisplayConfig'
+METHOD_TEMPORARY, METHOD_PERSISTENT = 1, 2
+
+KB_SCHEMA = 'org.gnome.settings-daemon.plugins.media-keys'
+KB_BASE = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/'
+KB_MINE = KB_BASE + 'monitor-layout-'
+
+
+def notify(msg, error=False):
+    print(msg, file=sys.stderr if error else sys.stdout)
+    try:
+        subprocess.run(['notify-send', '-a', 'Monitor layout', '-i', 'video-display',
+                        'Monitor layout', msg], check=False)
+    except FileNotFoundError:
+        pass
+
+
+def dbus(method, params=None):
+    from gi.repository import Gio
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return bus.call_sync(BUS, OBJ, BUS, method, params, None,
+                         Gio.DBusCallFlags.NONE, -1, None).unpack()
+
+
+def load():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save(data):
+    tmp = CONF + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, CONF)
+
+
+def is_builtin(mon):
+    (conn, _, _, _), _, props = mon
+    return bool(props.get('is-builtin')) or conn.startswith(('eDP', 'LVDS', 'DSI'))
+
+
+def current_mode(mon):
+    return next((m for m in mon[1] if m[6].get('is-current')), None)
+
+
+def pick_mode(modes, size=None, refresh=60.0):
+    # modes: (id, w, h, refresh, pref_scale, scales, props)
+    if size:
+        cands = [m for m in modes if (m[1], m[2]) == tuple(size)]
+        if cands:
+            return min(cands, key=lambda m: abs(m[3] - refresh))
+    for m in modes:
+        if m[6].get('is-preferred'):
+            return m
+    return modes[0]
+
+
+def record(monitors, logical):
+    cur = {m[0][0]: current_mode(m) for m in monitors}
+    out = []
+    for x, y, scale, transform, primary, specs, _ in logical:
+        mons = []
+        for conn, vendor, product, serial in specs:
+            md = cur[conn]
+            mons.append({'vendor': vendor, 'product': product, 'serial': serial,
+                         'connector': conn,  # info only
+                         'width': md[1], 'height': md[2], 'refresh': round(md[3], 3)})
+        out.append({'x': x, 'y': y, 'scale': scale, 'transform': transform,
+                    'primary': primary, 'monitors': mons})
+    return out
+
+
+def plan_recorded(monitors, rec):
+    by_edid = {m[0][1:]: m for m in monitors}
+    lms, missing = [], []
+    for lm in rec:
+        specs = []
+        for mon in lm['monitors']:
+            m = by_edid.get((mon['vendor'], mon['product'], mon['serial']))
+            if not m:
+                missing.append('%s %s' % (mon['product'], mon['serial']))
+                continue
+            md = pick_mode(m[1], (mon['width'], mon['height']), mon['refresh'])
+            specs.append((m[0][0], md[0], {}))
+        if specs:
+            lms.append((int(lm['x']), int(lm['y']), float(lm['scale']),
+                        int(lm['transform']), bool(lm['primary']), specs))
+    if missing:
+        raise SystemExit('Not connected: ' + ', '.join(missing))
+    return lms
+
+
+def plan_auto(monitors):
+    laptop = next((m for m in monitors if is_builtin(m)), None)
+    # USB-C (DP alt mode) / DP left, HDMI right
+    row = sorted((m for m in monitors if not is_builtin(m)),
+                 key=lambda m: (m[0][0].startswith('HDMI'), m[0][0]))
+    row = [(m, pick_mode(m[1])) for m in row]
+    row_w = sum(md[1] for _, md in row)
+
+    lms = []  # (x, y, scale, transform, primary, [(connector, mode_id, {})])
+    x = y = 0
+    if laptop:
+        lmode = current_mode(laptop) or pick_mode(laptop[1])
+        lms.append((max(0, (row_w - lmode[1]) // 2), 0, 1.0, 0, True,
+                    [(laptop[0][0], lmode[0], {})]))
+        y = lmode[2]
+        x = max(0, (lmode[1] - row_w) // 2)
+    for i, (m, md) in enumerate(row):
+        lms.append((x, y, 1.0, 0, not laptop and i == 0, [(m[0][0], md[0], {})]))
+        x += md[1]
+    return lms
+
+
+def describe(monitors, lms):
+    names = {m[0][0]: '%s %s' % (m[0][2], m[0][3]) for m in monitors}
+    used = {s[0] for lm in lms for s in lm[5]}
+    out = []
+    for x, y, scale, _, primary, specs in lms:
+        for conn, mode, _ in specs:
+            out.append('%-9s %-24s %-18s +%d+%d x%g%s' % (conn, names[conn], mode, x, y, scale,
+                                                         '  primary' if primary else ''))
+    out += ['%-9s %-24s off' % (c, n) for c, n in names.items() if c not in used]
+    return '\n'.join(out)
+
+
+def kb_settings():
+    from gi.repository import Gio
+    root = Gio.Settings.new(KB_SCHEMA)
+
+    def entry(path):
+        return Gio.Settings.new_with_path(KB_SCHEMA + '.custom-keybinding', path)
+    return root, entry
+
+
+def kb_list():
+    root, entry = kb_settings()
+    out = []
+    for p in root.get_strv('custom-keybindings'):
+        if p.startswith(KB_MINE):
+            e = entry(p)
+            out.append((e.get_string('binding'), e.get_string('command').split()[-1]))
+    return out
+
+
+MOD_ALIAS = {'control': 'ctrl', 'primary': 'ctrl', 'ctl': 'ctrl', 'mod4': 'super', 'mod1': 'alt'}
+
+
+def norm(accel):
+    mods = re.findall(r'<([^>]+)>', accel)
+    key = re.sub(r'<[^>]+>', '', accel).strip().lower()
+    return frozenset(MOD_ALIAS.get(m.lower(), m.lower()) for m in mods), key
+
+
+def gnome_accels():
+    # every accelerator GNOME (shell, wm, media keys, extensions, other custom shortcuts) uses
+    import glob
+    from gi.repository import Gio, GLib
+    default = Gio.SettingsSchemaSource.get_default()
+    sources = [(default, default.list_schemas(True)[0])]
+    sources_dirs = []
+    for d in glob.glob('/usr/share/gnome-shell/extensions/*/schemas') + \
+            glob.glob(os.path.expanduser('~/.local/share/gnome-shell/extensions/*/schemas')):
+        try:
+            src = Gio.SettingsSchemaSource.new_from_directory(d, None, False)
+            sources.append((src, src.list_schemas(False)[0]))
+            sources_dirs.append(d)
+        except GLib.Error:
+            pass
+
+    # {norm(accel): [hit]}, hit = (description, Gio.Settings, key, gsettings-cmd-prefix)
+    used = {}
+    for i, (src, ids) in enumerate(sources):
+        schemadir = '--schemadir %s ' % sources_dirs[i - 1] if i else ''
+        for sid in ids:
+            schema = src.lookup(sid, False)
+            if not schema or not schema.get_path():
+                continue
+            try:
+                s = Gio.Settings.new_full(schema, None, None)
+            except Exception:
+                continue
+            for k in schema.list_keys():
+                v = s.get_value(k)
+                t = v.get_type_string()
+                vals = [v.unpack()] if t == 's' else v.unpack() if t == 'as' else []
+                for a in vals:
+                    if a.startswith('<'):
+                        used.setdefault(norm(a), []).append(
+                            ('%s %s' % (sid, k), s, k, 'gsettings %sset %s %s' % (schemadir, sid, k)))
+
+    root, entry = kb_settings()
+    for p in root.get_strv('custom-keybindings'):
+        if not p.startswith(KB_MINE):
+            e = entry(p)
+            b = e.get_string('binding')
+            if b:
+                used.setdefault(norm(b), []).append(
+                    ('custom "%s"' % e.get_string('name'), e, 'binding',
+                     'gsettings set %s.custom-keybinding:%s binding' % (KB_SCHEMA, p)))
+    return used
+
+
+def free_key(hits, target):
+    # remove target accel from each GNOME setting; append undo commands to UNDO
+    from gi.repository import GLib
+    lines = []
+    for desc, s, k, cmd in hits:
+        v = s.get_value(k)
+        lines.append('%s "%s"  # %s' % (cmd, v.print_(False), desc))
+        if v.get_type_string() == 'as':
+            s.set_strv(k, [a for a in v.unpack() if norm(a) != target])
+        else:
+            s.set_string(k, '')
+    with open(UNDO, 'a') as f:
+        f.write('\n'.join(lines) + '\n')
+    return [h[0] for h in hits]
+
+
+def ours():
+    # {norm(accel): layout name} for this script's shortcuts
+    return {norm(a): n for a, n in kb_list() if a}
+
+
+def bind(name, n, force=False):
+    from gi.repository import Gio
+    root, entry = kb_settings()
+    paths = list(root.get_strv('custom-keybindings'))
+    mine = KB_MINE + re.sub(r'[^A-Za-z0-9_-]', '_', name) + '/'
+
+    if n == 'auto':
+        cur = {n_: a for a, n_ in kb_list()}.get(name)
+        if cur:
+            return cur  # already bound
+        used, taken = gnome_accels(), ours()
+        n = next((i for i in range(1, 13) if norm('%sF%d' % (MOD, i)) not in used
+                  and norm('%sF%d' % (MOD, i)) not in taken), None)
+        if not n:
+            raise SystemExit('no free %sF1..F12' % MOD)
+    elif n:
+        target = norm('%sF%d' % (MOD, n))
+        hits = gnome_accels().get(target)
+        if hits and not force:
+            raise SystemExit('%sF%d already used by %s (add --force to take it)'
+                             % (MOD, n, ', '.join(h[0] for h in hits)))
+        if hits:
+            print('freed from: ' + ', '.join(free_key(hits, target)) + '  (undo: sh %s)' % UNDO)
+    accel = '%sF%d' % (MOD, n)
+
+    def drop(p):
+        e = entry(p)
+        for k in ('name', 'command', 'binding'):
+            e.reset(k)
+        paths.remove(p)
+
+    for p in list(paths):
+        if n and p != mine and p.startswith(KB_MINE) and norm(entry(p).get_string('binding')) == norm(accel):
+            drop(p)  # key moves from another layout
+
+    if n:
+        e = entry(mine)
+        e.set_string('name', 'Monitors: %s' % name)
+        e.set_string('command', 'python3 %s %s' % (BIN, name))
+        e.set_string('binding', accel)
+        if mine not in paths:
+            paths.append(mine)
+    elif mine in paths:
+        drop(mine)
+    root.set_strv('custom-keybindings', paths)
+    Gio.Settings.sync()  # flush to dconf before exit
+    return accel if n else None
+
+
+def keys():
+    used, taken = gnome_accels(), ours()
+    for i in range(1, 13):
+        a = '%sF%d' % (MOD, i)
+        who = ', '.join(h[0] for h in used.get(norm(a), [])) or \
+            (taken.get(norm(a)) and 'monitor-layout ' + taken[norm(a)])
+        print('%-14s %s' % (a, who or 'free'))
+
+
+def short(hits):
+    return ', '.join(h[0].replace('org.gnome.settings-daemon.plugins.', '').replace('org.gnome.', '')
+                     for h in hits)
+
+
+def key_rows(name):
+    # [(n, status, info)] for F1..F12; status: current | taken | layout | free
+    used, taken = gnome_accels(), ours()
+    rows = []
+    for i in range(1, 13):
+        k = norm('%sF%d' % (MOD, i))
+        if taken.get(k) == name:
+            rows.append((i, 'current', short(used.get(k, []))))
+        elif k in used:
+            rows.append((i, 'taken', short(used[k])))
+        elif k in taken:
+            rows.append((i, 'layout', taken[k]))
+        else:
+            rows.append((i, 'free', ''))
+    return rows
+
+
+def zenity(*args):
+    # stdout on OK/Yes, None on Cancel/No/missing
+    try:
+        r = subprocess.run(['zenity'] + list(args), capture_output=True, text=True)
+    except FileNotFoundError:
+        notify('zenity missing: sudo apt install zenity', error=True)
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def choose_tty(name, rows):
+    pretty = MOD.replace('<', '').replace('>', '+')
+    print('%sF… for "%s":' % (pretty, name))
+    for i, st, info in rows:
+        print(' %s F%-3d %-8s %s' % ('>' if st == 'current' else ' ', i, st, info))
+    while True:
+        try:
+            a = input('Pick F-number (Enter = keep, 0 = remove): ').strip().lower().lstrip('f')
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if a == '':
+            return None
+        if not a.isdigit() or int(a) > 12:
+            print('1..12, 0 or Enter')
+            continue
+        n = int(a)
+        if n == 0:
+            return 0
+        _, st, info = rows[n - 1]
+        if st == 'current':
+            return None
+        if st == 'taken':
+            print('F%d taken by %s (to take it anyway: monitor-layout %s %d --force)' % (n, info, name, n))
+            continue
+        if st == 'layout':
+            try:
+                ok = input('F%d is used by "%s". Move it to "%s"? [y/N] ' % (n, info, name))
+            except (EOFError, KeyboardInterrupt):
+                ok = ''
+            if ok.strip().lower() != 'y':
+                continue
+        return n
+
+
+def choose_gui(name, rows):
+    import html
+    pretty = MOD.replace('<', '').replace('>', '+')
+    cells = []
+    for i, st, info in rows:
+        cells += ['F%d' % i, st, info]
+    cells += ['0', 'remove', 'no shortcut']
+    while True:
+        sel = zenity('--list', '--title=Monitor layout', '--width=480', '--height=500',
+                     '--text=%s shortcut for "%s"  (Cancel = keep)' % (html.escape(pretty + 'F…'), html.escape(name)),
+                     '--column=Key', '--column=Status', '--column=Used by', *cells)
+        if not sel:
+            return None
+        n = int(sel.split('|')[0].lstrip('F'))
+        if n == 0:
+            return 0
+        _, st, info = rows[n - 1]
+        if st == 'current':
+            return None
+        if st == 'taken':
+            zenity('--error', '--text=F%d is taken by %s' % (n, html.escape(info)))
+            continue
+        if st == 'layout' and zenity('--question', '--text=F%d is used by "%s". Move it to "%s"?'
+                                     % (n, html.escape(info), html.escape(name))) is None:
+            continue
+        return n
+
+
+def pick_key(name):
+    gui = not sys.stdin.isatty()
+    rows = key_rows(name)
+    n = (choose_gui if gui else choose_tty)(name, rows)
+    if n is None:
+        cur = next(('%sF%d' % (MOD, i) for i, st, _ in rows if st == 'current'), None)
+        msg = '%s: kept %s' % (name, cur) if cur else '%s: no shortcut' % name
+    else:
+        accel = bind(name, n)
+        msg = '%s -> %s' % (accel, name) if accel else 'shortcut removed: ' + name
+    if gui:
+        notify(msg)
+    else:
+        print(msg)
+
+
+def main(argv):
+    args = [a for a in argv if not a.startswith('-')]
+    flags = {a for a in argv if a.startswith('-')}
+
+    if not argv or flags & {'-h', '--help'} or args[:1] == ['help'] or args == ['record']:
+        print(HELP)
+        return 0
+
+    if args == ['keys']:
+        keys()
+        return 0
+
+    if len(args) == 2 and args[1] == 'free':
+        try:
+            pick_key(args[0])
+        except SystemExit as e:
+            print(e, file=sys.stderr)
+            return 1
+        return 0
+
+    if len(args) == 2 and args[0] != 'record':
+        name, n = args
+        if n != 'auto' and (not n.isdigit() or int(n) > 12):
+            print('N must be 0..12 or auto', file=sys.stderr)
+            return 2
+        try:
+            accel = bind(name, n if n == 'auto' else int(n), '--force' in flags)
+        except SystemExit as e:
+            print(e, file=sys.stderr)
+            return 1
+        print('%s -> %s' % (accel, name) if accel else 'shortcut removed: ' + name)
+        return 0
+
+    serial, monitors, logical, _ = dbus('GetCurrentState')
+    data = load()
+
+    if '--list' in flags:
+        for mon in monitors:
+            conn, vendor, product, ser = mon[0]
+            cur = current_mode(mon)
+            print('%-9s %s / %s / %s  %s%s' % (conn, vendor, product, ser, cur[0] if cur else 'off',
+                                              '  builtin' if is_builtin(mon) else ''))
+        print('recorded: %s  (%s)' % (', '.join(sorted(data)) or '-', CONF))
+        for accel, name in kb_list():
+            print('shortcut: %s -> %s' % (accel, name))
+        return 0
+
+    if len(args) == 2 and args[0] == 'record':
+        name = args[1]
+        data[name] = record(monitors, logical)
+        save(data)
+        lms = plan_recorded(monitors, data[name])
+        print(describe(monitors, lms))
+        notify('Recorded current layout as "%s"' % name)
+        pick_key(name)
+        return 0
+
+    if len(args) != 1 or args[0] == 'record':
+        print(HELP, file=sys.stderr)
+        return 2
+
+    name = args[0]
+    try:
+        lms = plan_recorded(monitors, data[name]) if name in data else plan_auto(monitors)
+    except SystemExit as e:
+        notify('%s: %s' % (name, e), error=True)
+        return 1
+
+    print(describe(monitors, lms))
+    if '--dry-run' in flags:
+        return 0
+
+    from gi.repository import GLib
+    method = METHOD_PERSISTENT if '--save' in flags else METHOD_TEMPORARY
+    try:
+        dbus('ApplyMonitorsConfig',
+             GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', (serial, method, lms, {})))
+    except GLib.Error as e:
+        notify('%s failed: %s' % (name, e.message), error=True)
+        return 1
+    notify('%s layout applied%s' % (name.capitalize(), '' if name in data else ' (auto)'))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

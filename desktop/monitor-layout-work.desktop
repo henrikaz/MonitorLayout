@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Monitors: Work
+Comment=Apply work monitor layout
+Exec=python3 @BIN@ work
+Icon=video-display
+Terminal=false
+Categories=Utility;Settings;
+Keywords=display;monitor;screen;layout;work;
+Actions=record;
+
+[Desktop Action record]
+Name=Record current layout as Work
+Exec=python3 @BIN@ record work
